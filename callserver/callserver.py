@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional, Tuple, Union
 import numpy as np
 
 from .allocationmanager import AllocationSetManager
-from .allocationset import AllocationSet
+from .allocationset import AllocationDescriptor, AllocationSet
 
 DEFAULT_AUTHKEY = b"callserver"
 
@@ -85,22 +85,15 @@ class CallServer:
             self.address, self.port = (
                 endpoint if isinstance(endpoint, tuple) else ("127.0.0.1", endpoint)
             )
+        self.authkey = authkey
         self.context = context
         self.context_args = args
         self.context_kwargs = kwargs
         self._alloc_manager = AllocationSetManager(self.name)
         self._call_in_progress = False
         self._started = False
-        if self.port:
-            self._pipe: Connection = Client(
-                (self.address, self.port), authkey=authkey
-            )
-            self._server_process: Optional[Process] = None
-        else:
-            self._pipe, self._server_pipe = Pipe()
-            self._server_process = Process(
-                name=self.name, target=run, args=(self._server_pipe,), daemon=True
-            )
+        self._pipe: Optional[Connection] = None
+        self._server_process: Optional[Process] = None
         self._last_result: Any = None
         self._last_result_raw: Any = None
         self._call_unpack_fn: Optional[Callable] = None
@@ -130,11 +123,31 @@ class CallServer:
         Returns:
             self, for method chaining.
         """
-        if self._server_process:
-            self._server_process.start()
-        self._pipe.send(
-            (self.name, self.context, self.context_args, self.context_kwargs)
-        )
+        if self._started:
+            return self
+        if self.port:
+            self._pipe = Client((self.address, self.port), authkey=self.authkey)
+        else:
+            self._pipe, server_pipe = Pipe()
+            self._server_process = Process(
+                name=self.name, target=run, args=(server_pipe,), daemon=True
+            )
+            try:
+                self._server_process.start()
+            except Exception:
+                self._pipe.close()
+                self._pipe = None
+                self._server_process = None
+                raise
+            finally:
+                server_pipe.close()
+        try:
+            self._pipe.send(
+                (self.name, self.context, self.context_args, self.context_kwargs)
+            )
+        except (OSError, EOFError):
+            self.stop()
+            raise
         self._started = True
         return self
 
@@ -219,6 +232,7 @@ class CallServer:
         self._call_in_progress = True
         self._call_unpack_fn = unpack_fn
         self._call_unpack_argset = argset
+        assert self._pipe is not None
         self._pipe.send((fn, argset.ix, args, kwargs))
 
     def call_async(self, fn: Callable, *args: Any, **kwargs: Any) -> None:
@@ -278,7 +292,7 @@ class CallServer:
         Returns:
             True if a result is ready to be retrieved, False otherwise.
         """
-        return self._pipe.poll()
+        return self._pipe.poll() if self._pipe is not None else False
 
     def wait_for_result(self, timeout: Optional[float] = None) -> bool:
         """
@@ -296,6 +310,7 @@ class CallServer:
         """
         if not self._call_in_progress:
             return True
+        assert self._pipe is not None
         return self._pipe.poll(timeout)
 
     def get_result(self, timeout: Optional[float] = None) -> Any:
@@ -317,6 +332,7 @@ class CallServer:
         """
         if not self._call_in_progress:
             return self._last_result
+        assert self._pipe is not None
         if not self._pipe.poll(timeout):
             raise TimeoutError(
                 f"Timed out waiting for result after {timeout} seconds"
@@ -338,14 +354,16 @@ class CallServer:
         Closes the connection and waits for the server process to terminate
         (if in child process mode).
         """
-        if not self._started:
+        if self._pipe is None and self._server_process is None:
             return
         self._started = False
-        self._pipe.close()
+        self._call_in_progress = False
+        if self._pipe is not None:
+            self._pipe.close()
+            self._pipe = None
         if self._server_process is not None:
             self._server_process.join()
             self._server_process = None
-            self._alloc_manager.close()
 
     def __del__(self) -> None:
         """Clean up resources when the client is garbage collected."""
@@ -354,8 +372,11 @@ class CallServer:
         except Exception:
             pass  # Ignore errors during cleanup
 
+
 def run(
-    endpoint_or_connection: Union[Connection, Tuple[str, int, bytes]],
+    endpoint_or_connection: Optional[Union[Connection, Tuple[str, int, bytes]]] = None,
+    *,
+    context: Any = None,
 ) -> None:
     """
     Server loop for handling RPC calls.
@@ -364,17 +385,12 @@ def run(
     clients and returning results. It can operate in two modes:
 
     1. Child process mode: Receives a connection from a parent process
-    2. Standalone mode: Listens for TCP connections on a specified endpoint.
-       In this mode the function never returns; after a client disconnects,
-       it waits for the next client.
+    2. Standalone mode: Listens for TCP connections on a specified endpoint
 
     Args:
         endpoint_or_connection: Either a Connection object (for child process
             mode), or a tuple of (address, port, authkey) for standalone mode.
-
-    Example:
-        >>> from callserver import run
-        >>> run(("127.0.0.1", 5000, b"callserver"))  # blocks forever
+        context: Host-owned context in place of client-supplied context.
     """
     keep_alive = isinstance(endpoint_or_connection, tuple)
     pipe: Optional[Connection] = None if keep_alive else endpoint_or_connection
@@ -391,22 +407,23 @@ def run(
             continue
 
         alloc_manager = AllocationSetManager(name)
-        if not config or config != (name, context_init, context_args, context_kwargs):
-            config = (name, context_init, context_args, context_kwargs)
-            try:
-                context = (
-                    context_init(*context_args, **context_kwargs)
-                    if callable(context_init)
-                    else context_init
-                )
-            except Exception as e:
+        if context is None:
+            if not config or config != (name, context_init, context_args, context_kwargs):
+                config = (name, context_init, context_args, context_kwargs)
                 try:
-                    pipe.send(e)
-                except (EOFError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                    pass
-                if not keep_alive:
-                    return
-                continue
+                    context = (
+                        context_init(*context_args, **context_kwargs)
+                        if callable(context_init)
+                        else context_init
+                    )
+                except Exception as e:
+                    try:
+                        pipe.send(e)
+                    except (EOFError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        pass
+                    if not keep_alive:
+                        return
+                    continue
 
         while pipe:
             try:
@@ -416,13 +433,16 @@ def run(
                     return
                 break
 
-            fn, arg_set_idx, args, kwargs = cmd
-            argset = alloc_manager.get_allocation_set(fn, arg_set_idx)
-            args, kwargs = argset.args_from_sharedmemory(*args, **kwargs)
-            result = (
-                fn(context, *args, **kwargs) if context is not None else fn(*args, **kwargs)
-            )
-            result = argset.retval_to_sharedmemory(result)
+            try:
+                fn, arg_set_idx, args, kwargs = cmd
+                argset = alloc_manager.get_allocation_set(fn, arg_set_idx)
+                args, kwargs = argset.args_from_sharedmemory(*args, **kwargs)
+                result = (
+                    fn(context, *args, **kwargs) if context is not None else fn(*args, **kwargs)
+                )
+                result = argset.retval_to_sharedmemory(result)
+            except Exception as e:
+                result = e
             try:
                 pipe.send(result)
             except (EOFError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
