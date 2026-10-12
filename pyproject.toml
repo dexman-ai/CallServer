@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "callserver"
+version = "0.1.0"
+description = "Shared-memory RPC for fast inter-process function calls with numpy arrays."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "dexman-ai" }]
+requires-python = ">=3.8"
+dependencies = ["numpy"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+callserver = "callserver:run_console"
+
+[tool.setuptools]
+packages = ["callserver"]
+
+[tool.setuptools.package-data]
+callserver = ["py.typed", "callserver.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["."]
