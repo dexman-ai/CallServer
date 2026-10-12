@@ -95,16 +95,16 @@ The server handles one client at a time and keeps running after a client disconn
 
 ## Documentation
 
-- [Usage guide](callserver/callserver.md): async calls, double-buffering, pre-allocated buffers, standalone servers, the API reference, and how it works.
-- [Examples](examples): runnable scripts.
+- [Usage guide](https://github.com/dexman-ai/CallServer/blob/main/callserver/callserver.md): async calls, double-buffering, pre-allocated buffers, standalone servers, the API reference, and how it works.
+- [Examples](https://github.com/dexman-ai/CallServer/tree/main/examples): runnable scripts.
 
 | Example | Shows |
 | --- | --- |
-| [simple_call.py](examples/simple_call.py) | Basic synchronous call |
-| [server_state.py](examples/server_state.py) | Server-side state with a context initializer |
-| [async_calls.py](examples/async_calls.py) | Async calls with double-buffering |
-| [preallocated_buffers.py](examples/preallocated_buffers.py) | Zero-copy with pre-allocated shared memory |
-| [standalone_client.py](examples/standalone_client.py) | Connecting to a standalone server |
+| [simple_call.py](https://github.com/dexman-ai/CallServer/blob/main/examples/simple_call.py) | Basic synchronous call |
+| [server_state.py](https://github.com/dexman-ai/CallServer/blob/main/examples/server_state.py) | Server-side state with a context initializer |
+| [async_calls.py](https://github.com/dexman-ai/CallServer/blob/main/examples/async_calls.py) | Async calls with double-buffering |
+| [preallocated_buffers.py](https://github.com/dexman-ai/CallServer/blob/main/examples/preallocated_buffers.py) | Zero-copy with pre-allocated shared memory |
+| [standalone_client.py](https://github.com/dexman-ai/CallServer/blob/main/examples/standalone_client.py) | Connecting to a standalone server |
 
 ## Development
 
@@ -115,4 +115,4 @@ python -m pytest
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/dexman-ai/CallServer/blob/main/LICENSE).

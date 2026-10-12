@@ -20,6 +20,11 @@ classifiers = [
 [project.optional-dependencies]
 test = ["pytest"]
 
+[project.urls]
+Homepage = "https://github.com/dexman-ai/CallServer"
+Repository = "https://github.com/dexman-ai/CallServer"
+Issues = "https://github.com/dexman-ai/CallServer/issues"
+
 [project.scripts]
 callserver = "callserver:run_console"
 
