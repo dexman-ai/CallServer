@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "callserver"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared-memory RPC for fast inter-process function calls with numpy arrays."
 readme = "README.md"
 license = "MIT"
