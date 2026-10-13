@@ -1,6 +1,6 @@
 # callserver
 
-Fast inter-process function calls for Python, with numpy arrays passed through shared memory.
+Super-fast, low-overhead inter-process function calls for Python usnig shared memory. Useful for passing large arrays (e.g. images) between processes without serialization and transport overhead. <1k LOC.
 
 ## Overview
 
