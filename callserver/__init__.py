@@ -40,7 +40,7 @@ For more details, see the callserver.md documentation file.
 """
 
 from .allocationmanager import AllocationSetManager
-from .allocationset import AllocationDescriptor, AllocationSet
+from .allocationset import REUSE, AllocationDescriptor, AllocationSet, Reuse
 from .callserver import DEFAULT_AUTHKEY, CallServer, run, run_console
 
 __all__ = [
@@ -48,6 +48,8 @@ __all__ = [
     "run",
     "run_console",
     "DEFAULT_AUTHKEY",
+    "REUSE",
+    "Reuse",
     "AllocationSet",
     "AllocationDescriptor",
     "AllocationSetManager",

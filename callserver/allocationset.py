@@ -8,7 +8,9 @@ converting numpy arrays to/from shared memory segments.
 
 from __future__ import annotations
 
+import io
 import logging
+import pickle
 from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -53,6 +55,76 @@ class AllocationDescriptor:
 
     def __repr__(self) -> str:
         return f"AllocationDescriptor(name={self.name!r}, shape={self.shape}, dtype={self.dtype})"
+
+
+class Reuse:
+    """
+    Marker that sends the buffer already allocated at this position, without copying.
+
+    Pass REUSE where an array was passed on an earlier call. The other side
+    receives the existing shared memory buffer, with its contents unchanged.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "REUSE"
+
+
+REUSE = Reuse()
+
+_Promoted = Dict[int, Tuple[np.ndarray, AllocationDescriptor]]
+
+
+class _SharedMemoryPickler(pickle.Pickler):
+    """Pickler that replaces large arrays, at any depth, with AllocationDescriptors."""
+
+    def __init__(
+        self, file: io.BytesIO, argset: AllocationSet, prefix: str, promoted: _Promoted
+    ) -> None:
+        super().__init__(file, protocol=pickle.HIGHEST_PROTOCOL)
+        self._argset = argset
+        self._prefix = prefix
+        self._promoted = promoted
+        self._slot = 0
+
+    def _next_name(self) -> str:
+        name = self._prefix if self._slot == 0 else f"{self._prefix}.{self._slot}"
+        self._slot += 1
+        return name
+
+    def persistent_id(self, obj: Any) -> Optional[AllocationDescriptor]:
+        if isinstance(obj, Reuse):
+            name = self._next_name()
+            if name not in self._argset._descriptors:
+                raise KeyError(
+                    f"REUSE at {name}: no buffer was allocated at this position on an earlier call."
+                )
+            return self._argset.get(name)
+        if not self._argset.is_mappable(obj):
+            return None
+        # Consume a slot even for duplicates, so names depend only on position.
+        name = self._next_name()
+        hit = self._promoted.get(id(obj))
+        if hit is not None:
+            return hit[1]
+        desc = self._argset.to_sharedmemory(name, obj)
+        # Keep obj referenced so its id cannot be reused within this call.
+        self._promoted[id(obj)] = (obj, desc)
+        return desc
+
+
+class _SharedMemoryUnpickler(pickle.Unpickler):
+    """Unpickler that maps AllocationDescriptors back to shared memory arrays."""
+
+    def __init__(self, file: io.BytesIO, argset: AllocationSet) -> None:
+        super().__init__(file)
+        self._argset = argset
+
+    def persistent_load(self, pid: Any) -> np.ndarray:
+        if not isinstance(pid, AllocationDescriptor):
+            raise pickle.UnpicklingError(f"Unsupported persistent id: {pid!r}")
+        return self._argset.from_sharedmemory(pid)
 
 
 class AllocationSet:
@@ -161,25 +233,24 @@ class AllocationSet:
 
     def is_mappable(self, arg: Any) -> bool:
         """
-        Check if an argument should be transferred via shared memory.
+        Check if an object should be transferred via shared memory.
 
-        Arguments are mapped to shared memory if they are numpy arrays larger
-        than MIN_SIZE bytes. None values are also considered mappable if a
-        corresponding allocation already exists.
+        Numpy arrays larger than MIN_SIZE bytes are mapped, unless their dtype
+        holds Python objects, which cannot live in shared memory.
 
         Args:
-            arg: The argument to check.
+            arg: The object to check.
 
         Returns:
-            True if the argument should use shared memory, False otherwise.
+            True if the object should use shared memory, False otherwise.
         """
-        return arg is None or (
-            isinstance(arg, np.ndarray) and arg.nbytes > AllocationSet.MIN_SIZE
+        return (
+            isinstance(arg, np.ndarray)
+            and not arg.dtype.hasobject
+            and arg.nbytes > AllocationSet.MIN_SIZE
         )
 
-    def to_sharedmemory(
-        self, name: str, array: Optional[np.ndarray]
-    ) -> Optional[AllocationDescriptor]:
+    def to_sharedmemory(self, name: str, array: np.ndarray) -> AllocationDescriptor:
         """
         Convert a numpy array to a shared memory allocation.
 
@@ -189,18 +260,15 @@ class AllocationSet:
 
         Args:
             name: Logical name for the allocation.
-            array: The numpy array to convert, or None.
+            array: The numpy array to convert.
 
         Returns:
-            An AllocationDescriptor for the shared memory buffer, or None if
-            array is None and no existing allocation exists.
+            An AllocationDescriptor for the shared memory buffer.
 
         Raises:
-            AssertionError: If array is not a numpy array (when not None).
+            AssertionError: If array is not a numpy array.
             AssertionError: If shape or dtype changed for an existing allocation.
         """
-        if array is None:
-            return self.get(name) if name in self._descriptors else None
         assert isinstance(array, np.ndarray)
         for id, existing in self._arrays.items():
             if array is existing:
@@ -241,127 +309,104 @@ class AllocationSet:
         self._arrays[descriptor.name] = array
         return array
     
+    def dumps(self, obj: Any, prefix: str, promoted: Optional[_Promoted] = None) -> bytes:
+        """
+        Pickle obj, moving large arrays at any depth to shared memory.
+
+        Buffers are named prefix, prefix.1, prefix.2, ... in pickling order.
+        Promoted arrays and REUSE markers each take one slot, so the same
+        structure reuses the same buffers on later calls.
+
+        Args:
+            obj: The object to pickle.
+            prefix: Name prefix for the buffers allocated for obj.
+            promoted: Arrays already promoted in this call, keyed by id. An array
+                that appears more than once is promoted only once.
+
+        Returns:
+            The pickled bytes, with large arrays replaced by AllocationDescriptors.
+        """
+        buf = io.BytesIO()
+        _SharedMemoryPickler(buf, self, prefix, {} if promoted is None else promoted).dump(obj)
+        return buf.getvalue()
+
+    def loads(self, data: bytes) -> Any:
+        """
+        Unpickle data produced by dumps(), mapping descriptors to numpy arrays.
+
+        Args:
+            data: The pickled bytes.
+
+        Returns:
+            The unpickled object, with descriptors replaced by shared memory arrays.
+        """
+        return _SharedMemoryUnpickler(io.BytesIO(data), self).load()
+
     def args_to_sharedmemory(
         self, *args: Any, **kwargs: Any
-    ) -> Tuple[List[Any], Dict[str, Any]]:
+    ) -> Tuple[List[bytes], Dict[str, bytes]]:
         """
-        Convert function arguments to shared memory representations.
+        Pickle function arguments, moving large arrays at any depth to shared memory.
 
-        Large numpy arrays in the arguments are converted to AllocationDescriptors,
-        while other arguments are passed through unchanged.
+        Each argument is pickled separately, so buffer names stay tied to the
+        argument position or keyword even when other arguments change between
+        calls. An array passed more than once in the same call is promoted once.
 
         Args:
             *args: Positional arguments to convert.
             **kwargs: Keyword arguments to convert.
 
         Returns:
-            A tuple of (positional_args, keyword_args) with arrays replaced by
-            their AllocationDescriptors.
+            A tuple of (positional_args, keyword_args), each argument pickled to bytes.
         """
+        promoted: _Promoted = {}
         positional_args = [
-            self.to_sharedmemory(f"__arg{idx}", arg) if self.is_mappable(arg) else arg
-            for idx, arg in enumerate(args)
+            self.dumps(arg, f"__arg{idx}", promoted) for idx, arg in enumerate(args)
         ]
-        keyword_args = {
-            k: self.to_sharedmemory(k, v) if self.is_mappable(v) else v
-            for k, v in kwargs.items()
-        }
+        keyword_args = {k: self.dumps(v, f"__kw.{k}", promoted) for k, v in kwargs.items()}
         return positional_args, keyword_args
 
     def args_from_sharedmemory(
-        self, *args: Any, **kwargs: Any
+        self, *args: bytes, **kwargs: bytes
     ) -> Tuple[List[Any], Dict[str, Any]]:
         """
-        Convert function arguments from shared memory representations.
-
-        AllocationDescriptors in the arguments are mapped to numpy arrays,
-        while other arguments are passed through unchanged.
+        Unpickle function arguments produced by args_to_sharedmemory().
 
         Args:
-            *args: Positional arguments to convert.
-            **kwargs: Keyword arguments to convert.
+            *args: Pickled positional arguments.
+            **kwargs: Pickled keyword arguments.
 
         Returns:
             A tuple of (positional_args, keyword_args) with descriptors replaced
             by their numpy array views.
         """
-        positional_args = [
-            self.from_sharedmemory(arg) if isinstance(arg, AllocationDescriptor) else arg
-            for arg in args
-        ]
-        keyword_args = {
-            k: self.from_sharedmemory(v) if isinstance(v, AllocationDescriptor) else v
-            for k, v in kwargs.items()
-        }
+        positional_args = [self.loads(arg) for arg in args]
+        keyword_args = {k: self.loads(v) for k, v in kwargs.items()}
         return positional_args, keyword_args
 
-    def retval_to_sharedmemory(self, retval: Any) -> Any:
+    def retval_to_sharedmemory(self, retval: Any) -> bytes:
         """
-        Convert a function's return value to shared memory representation.
-
-        Supports return values that are tuples, lists, dicts, or single values.
-        Large numpy arrays are converted to AllocationDescriptors.
+        Pickle a return value, moving large arrays at any depth to shared memory.
 
         Args:
             retval: The return value to convert.
 
         Returns:
-            The return value with large arrays replaced by AllocationDescriptors.
+            The pickled return value.
         """
-        if isinstance(retval, tuple):
-            return tuple(
-                self.to_sharedmemory(f"__retval{idx}", v) if self.is_mappable(v) else v
-                for idx, v in enumerate(retval)
-            )
-        if isinstance(retval, list):
-            return [
-                self.to_sharedmemory(f"__retval{idx}", v) if self.is_mappable(v) else v
-                for idx, v in enumerate(retval)
-            ]
-        if isinstance(retval, dict):
-            return {
-                k: self.to_sharedmemory(k, v) if self.is_mappable(v) else v
-                for k, v in retval.items()
-            }
-        return (
-            self.to_sharedmemory("__retval0", retval)
-            if self.is_mappable(retval)
-            else retval
-        )
+        return self.dumps(retval, "__retval")
 
-    def retval_from_sharedmemory(self, retval: Any) -> Any:
+    def retval_from_sharedmemory(self, data: bytes) -> Any:
         """
-        Convert a function's return value from shared memory representation.
-
-        Supports return values that are tuples, lists, dicts, or single values.
-        AllocationDescriptors are mapped to numpy arrays.
+        Unpickle a return value produced by retval_to_sharedmemory().
 
         Args:
-            retval: The return value to convert.
+            data: The pickled return value.
 
         Returns:
             The return value with descriptors replaced by numpy array views.
         """
-        if isinstance(retval, tuple):
-            return tuple(
-                self.from_sharedmemory(v) if isinstance(v, AllocationDescriptor) else v
-                for v in retval
-            )
-        if isinstance(retval, list):
-            return [
-                self.from_sharedmemory(v) if isinstance(v, AllocationDescriptor) else v
-                for v in retval
-            ]
-        if isinstance(retval, dict):
-            return {
-                k: self.from_sharedmemory(v) if isinstance(v, AllocationDescriptor) else v
-                for k, v in retval.items()
-            }
-        return (
-            self.from_sharedmemory(retval)
-            if isinstance(retval, AllocationDescriptor)
-            else retval
-        )
+        return self.loads(data)
 
     def close(self) -> None:
         """

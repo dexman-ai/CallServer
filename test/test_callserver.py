@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import operator
 import os
 import socket
 import time
@@ -25,6 +26,7 @@ from unittest import mock
 import numpy as np
 
 from callserver import (
+    REUSE,
     AllocationDescriptor,
     AllocationSet,
     AllocationSetManager,
@@ -90,63 +92,89 @@ class TestAllocationSet(unittest.TestCase):
         alloc_set = AllocationSet(0, "test")
 
         try:
-            # None is mappable (allows server-side allocation via to_sharedmemory)
-            self.assertTrue(alloc_set.is_mappable(None))
-
-            # Large arrays are mappable
-            large_array = np.ones((1000, 1000))
-            self.assertTrue(alloc_set.is_mappable(large_array))
-
-            # Small arrays are not mappable (sent via pipe)
-            small_array = np.ones((2, 2))
-            self.assertFalse(alloc_set.is_mappable(small_array))
-
-            # Non-arrays are not mappable
+            self.assertFalse(alloc_set.is_mappable(None))
+            self.assertTrue(alloc_set.is_mappable(np.ones((1000, 1000))))
+            # Small arrays are sent via the pipe
+            self.assertFalse(alloc_set.is_mappable(np.ones((2, 2))))
+            # Object arrays cannot live in shared memory
+            self.assertFalse(alloc_set.is_mappable(np.empty(1000, dtype=object)))
             self.assertFalse(alloc_set.is_mappable(42))
             self.assertFalse(alloc_set.is_mappable("string"))
         finally:
             alloc_set.close()
 
     def test_args_conversion(self):
-        """Test converting function arguments to/from shared memory."""
+        """Test nested arguments round-trip, with duplicates promoted once."""
+        client = AllocationSet(0, "client")
+        server = AllocationSet(0, "server")
+
+        try:
+            large = np.arange(1_000_000, dtype=np.float64).reshape(1000, 1000)
+            args, kwargs = client.args_to_sharedmemory(
+                large, 42, nested={"a": [large, (large * 2, 7)]}
+            )
+            self.assertEqual(len(client._linked_buffers), 2)
+
+            args, kwargs = server.args_from_sharedmemory(*args, **kwargs)
+            np.testing.assert_array_equal(args[0], large)
+            self.assertEqual(args[1], 42)
+            self.assertIs(kwargs["nested"]["a"][0], args[0])
+            np.testing.assert_array_equal(kwargs["nested"]["a"][1][0], large * 2)
+            self.assertEqual(kwargs["nested"]["a"][1][1], 7)
+        finally:
+            server.close()
+            client.close()
+
+    def test_nested_buffers_reused(self):
+        """Test nested arrays reuse their buffers on later calls."""
         alloc_set = AllocationSet(0, "test")
 
         try:
-            # Test args_to_sharedmemory
-            large_array = np.ones((1000, 1000))
-            small_value = 42
+            for i in range(3):
+                payload = {"x": np.full((100, 100), i), "y": [np.full((100, 100), -i)]}
+                (data,), _ = alloc_set.args_to_sharedmemory(payload)
+                result = alloc_set.loads(data)
+                self.assertEqual(result["x"][0, 0], i)
+                self.assertEqual(result["y"][0][0, 0], -i)
+            self.assertEqual(len(alloc_set._linked_buffers), 2)
+        finally:
+            alloc_set.close()
 
-            args, kwargs = alloc_set.args_to_sharedmemory(large_array, small_value, key=large_array.copy())
+    def test_reuse_marker(self):
+        """Test REUSE sends the existing buffer and None stays None."""
+        alloc_set = AllocationSet(0, "test")
 
-            # Large array should become a descriptor
-            self.assertIsInstance(args[0], AllocationDescriptor)
-            # Small value should remain unchanged
-            self.assertEqual(args[1], 42)
-            # Keyword arg with large array should become descriptor
-            self.assertIsInstance(kwargs["key"], AllocationDescriptor)
+        try:
+            with self.assertRaises(KeyError):
+                alloc_set.args_to_sharedmemory(REUSE)
+
+            first, _ = alloc_set.args_to_sharedmemory(np.ones((1000, 1000)))
+            again, _ = alloc_set.args_to_sharedmemory(REUSE)
+            self.assertEqual(len(alloc_set._linked_buffers), 1)
+            self.assertIs(alloc_set.loads(again[0]), alloc_set.loads(first[0]))
+
+            none_args, _ = alloc_set.args_to_sharedmemory(None)
+            self.assertIsNone(alloc_set.loads(none_args[0]))
         finally:
             alloc_set.close()
 
     def test_retval_conversion(self):
-        """Test converting return values to/from shared memory."""
-        alloc_set = AllocationSet(0, "test")
+        """Test nested return values round-trip."""
+        server = AllocationSet(0, "server")
+        client = AllocationSet(0, "client")
 
         try:
-            # Test tuple return
             large = np.ones((1000, 1000))
-            small = 42
-            result = alloc_set.retval_to_sharedmemory((large, small))
-            self.assertIsInstance(result, tuple)
-            self.assertIsInstance(result[0], AllocationDescriptor)
-            self.assertEqual(result[1], 42)
+            data = server.retval_to_sharedmemory({"array": large, "pair": (large * 2, 42)})
+            self.assertEqual(len(server._linked_buffers), 2)
 
-            # Test dict return
-            result = alloc_set.retval_to_sharedmemory({"array": large, "value": small})
-            self.assertIsInstance(result, dict)
-            self.assertIsInstance(result["array"], AllocationDescriptor)
-            self.assertEqual(result["value"], 42)
+            result = client.retval_from_sharedmemory(data)
+            np.testing.assert_array_equal(result["array"], large)
+            np.testing.assert_array_equal(result["pair"][0], large * 2)
+            self.assertEqual(result["pair"][1], 42)
         finally:
-            alloc_set.close()
+            client.close()
+            server.close()
 
     def test_repr(self):
         """Test AllocationSet string representation."""
@@ -335,6 +363,18 @@ class TestCallServerIntegration(unittest.TestCase):
             self.assertIn("__arg0", alloc_set._descriptors)
             self.assertIn("__arg1", alloc_set._descriptors)
 
+    def test_nested_arguments_round_trip(self):
+        """Arrays nested in argument containers go through shared memory."""
+        with CallServer("test_nested_args") as server:
+            payload = {"a": [np.full((100, 100), 5.0)], "b": 1}
+            alloc_set = server.get_allocation_set(operator.getitem)
+
+            result = server.call(operator.getitem, payload, "a")
+
+            self.assertIn("__arg0", alloc_set._descriptors)
+            self.assertEqual(result[0][0, 0], 5.0)
+            mapped = server._alloc_manager.get_allocation_set(operator.getitem, 0)
+            self.assertTrue(any(result[0] is arr for arr in mapped._arrays.values()))
     def test_output_arrays_promoted_to_shared_memory(self):
         """Verify that output (return) arrays are promoted to shared memory."""
         with CallServer("test_output_shm") as server:

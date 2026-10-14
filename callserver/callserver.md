@@ -16,7 +16,7 @@ For runnable scripts, see the [examples](../examples) folder.
 
 - **Zero-serialization transfer**: Large numpy arrays are automatically promoted to shared memory instead of being pickled.
 - **Zero-copy transfer**: Arrays can be pre-allocated in shared memory, requiring no copy and no serialization.
-- **Transparent buffer management**: Arrays are promoted automatically when passed directly as positional or keyword arguments, or returned directly or inside a tuple, list or dictionary. Shared memory is allocated on the first call and reused on subsequent calls.
+- **Transparent buffer management**: Arrays are promoted automatically wherever they appear in arguments and return values, including inside nested containers, dataclasses and other picklable objects. Shared memory is allocated on the first call and reused on subsequent calls.
 - **Flexible call patterns**: Synchronous and asynchronous calls.
 - **Double-buffering**: Front/back buffer pattern for overlapping server-side computation with client-side processing.
 - **Connection modes**: Spawn a child process, or connect to a standalone server via TCP.
@@ -26,8 +26,7 @@ For runnable scripts, see the [examples](../examples) folder.
 
 - **Local machine only**: Shared memory cannot be used across machines.
 - **Single async call**: Only one asynchronous call can be in progress at a time per `CallServer` instance.
-- **Simple data structures**: Arrays nested inside argument containers are not promoted. Return values are promoted one level deep (tuple, list or dict).
-- **Fixed shapes**: The shape and dtype of an array argument must not change between calls to the same function.
+- **Stable structure**: Within one argument or return value, buffers are assigned in pickling order. The arrays, their order, shapes and dtypes must stay the same between calls to the same function.
 - **Picklable functions**: Server-side functions and context initializers are pickled by reference, so they must be defined at module level and importable by the server process.
 
 ## Usage
@@ -217,7 +216,9 @@ See [examples/standalone_client.py](../examples/standalone_client.py).
 
 - Always call `get_result()` after an asynchronous call before starting a new one.
 - Returned arrays are views of shared memory that the next call to the same function reuses. Copy them (`result.copy()`) if you need to keep them beyond the next call, or use double-buffering.
-- Arrays of 1024 bytes or less (`AllocationSet.MIN_SIZE`) are pickled and sent through the pipe or socket rather than promoted to shared memory.
+- Arrays of 1024 bytes or less (`AllocationSet.MIN_SIZE`) are pickled and sent through the pipe or socket rather than promoted to shared memory. Arrays with an `object` dtype are always pickled.
+- An array passed more than once in the same call is promoted once, and the server receives the same array object in each place.
+- Pass `REUSE` where an array was passed on an earlier call to send the existing shared memory buffer unchanged, without copying. Raises `KeyError` if no buffer was allocated at that position yet.
 - In child process mode, `stop()` waits for the server process to exit and releases all shared memory. In standalone mode, `stop()` only disconnects; the server keeps running.
 
 ## How It Works
@@ -240,17 +241,17 @@ See [examples/standalone_client.py](../examples/standalone_client.py).
 └─────────────────┘                  └─────────────────┘
 ```
 
-1. On each call, the client replaces large array arguments with `AllocationDescriptor`s (shared memory name, shape, dtype), copying the data into shared memory unless the array already lives there.
-2. The function reference, descriptors and remaining arguments are pickled and sent through the pipe or socket.
-3. The server maps the descriptors back to numpy arrays, calls the function, and replaces large arrays in the return value with descriptors.
-4. The client maps the returned descriptors to numpy arrays.
+1. On each call, the client pickles each argument separately. Large arrays found anywhere in an argument are replaced with `AllocationDescriptor`s (shared memory name, shape, dtype), copying the data into shared memory unless the array already lives there.
+2. The function reference and the pickled arguments are sent through the pipe or socket.
+3. The server unpickles the arguments, mapping descriptors back to numpy arrays, calls the function, and pickles the return value the same way.
+4. The client unpickles the return value, mapping descriptors to numpy arrays.
 
 Each process has one `AllocationSetManager` per server name, holding one or more `AllocationSet`s per function. Each `AllocationSet` tracks two kinds of shared memory buffers:
 
 - **Linked buffers**: created by this process and owned by it (unlinked on close).
 - **Mapped buffers**: created by the other process and only mapped for read/write access.
 
-Buffers are created on the first call and reused on later calls, keyed by argument position or keyword name (`__arg0`, `__arg1`, ..., `__retval0`, ...).
+Buffers are created on the first call and reused on later calls. They are named by argument position or keyword (`__arg0`, `__arg1`, `__kw.name`, `__retval`), with `.1`, `.2`, ... appended for each further array within the same argument or return value.
 
 ## API Reference
 
@@ -290,6 +291,7 @@ CallServer(name, context=None, *args, authkey=DEFAULT_AUTHKEY, **kwargs)
 ### Constants
 
 - `DEFAULT_AUTHKEY`: Default authentication key (`b"callserver"`).
+- `REUSE`: Marker argument that sends the buffer already allocated at its position, without copying. Instance of `Reuse`.
 
 ### AllocationSet
 
